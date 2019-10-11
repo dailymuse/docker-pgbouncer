@@ -45,6 +45,12 @@ if [ -n "$DB_USER" -a -n "$DB_PASSWORD" ] && ! grep -q "^\"$DB_USER\"" ${PG_CONF
   echo "Wrote authentication credentials to ${PG_CONFIG_DIR}/userlist.txt"
 fi
 
+if [ -n "$ADMIN_USERS" -a -n "$ADMIN_PASSWORD" ] && ! grep -q "^\"$ADMIN_USERS\"" ${PG_CONFIG_DIR}/userlist.txt; then
+  encrypted_pass="md5$(echo -n "$ADMIN_PASSWORD$ADMIN_USERS" | md5sum | cut -f 1 -d ' ')"
+  echo "\"$ADMIN_USERS\" \"$encrypted_pass\"" >> ${PG_CONFIG_DIR}/userlist.txt
+  echo "Wrote authentication credentials to ${PG_CONFIG_DIR}/userlist.txt"
+fi
+
 if [ ! -f ${PG_CONFIG_DIR}/pgbouncer.ini ]; then
   echo "Create pgbouncer config in ${PG_CONFIG_DIR}"
 
@@ -140,4 +146,25 @@ cat ${PG_CONFIG_DIR}/pgbouncer.ini
 echo "Starting $*..."
 fi
 
-exec "$@"
+# pgbouncer-healthcheck never really logs anything interesting [logs nothing except startup, and panics], so we are okay
+# to run in background. We can check the main logs from pgbouncer to find out if something went haywire.
+# Interrupts should kill the background process. Mostly useful when testing locally in terminal.
+trap 'kill $pid; exit' INT
+export PGBOUNCER_PORT="${LISTEN_PORT:-5432}"
+if [ -n "$ADMIN_USERS" -a -n "$ADMIN_PASSWORD" ]; then
+  export ENHANCED_CHECK="true"
+  dbname="pgbouncer"
+  export PGUSER="$ADMIN_USERS"
+  export PGPASSWORD="$ADMIN_PASSWORD"
+else
+  export ENHANCED_CHECK="false"
+  dbname="$DB_NAME"
+  export PGUSER="$DB_USER"
+  export PGPASSWORD="$DB_PASSWORD"
+fi
+export CONNSTR="host=localhost dbname=$dbname sslmode=disable"
+/pgbouncer-healthcheck &
+pid=$!
+
+unset CONNSTR PGBOUNCER_PORT ENHANCED_CHECK PGUSER PGPASSWORD
+/usr/bin/pgbouncer "$@"
