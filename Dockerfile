@@ -1,3 +1,8 @@
+FROM golang:1.10.2-alpine AS builder
+
+RUN apk --update add git
+RUN go get github.com/deliveroo/pgbouncer-healthcheck
+
 FROM alpine:3.7
 ARG VERSION=1.11.0
 
@@ -23,8 +28,14 @@ RUN \
   cd /tmp && \
   rm -rf /tmp/pgbouncer*  && \
   apk del --purge autoconf autoconf-doc automake udns-dev curl gcc libc-dev libevent-dev libtool make man libressl-dev pkgconfig
-ADD entrypoint.sh /entrypoint.sh
+
+COPY --from=builder /go/bin/pgbouncer-healthcheck /pgbouncer-healthcheck
+
+COPY entrypoint.sh /entrypoint.sh
+
 USER postgres
-EXPOSE 5432
+
+EXPOSE 5432 8000
+
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["/usr/bin/pgbouncer", "/etc/pgbouncer/pgbouncer.ini"]
+CMD ["/etc/pgbouncer/pgbouncer.ini"]
