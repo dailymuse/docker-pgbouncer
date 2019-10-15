@@ -37,19 +37,40 @@ if [ -n "$DATABASE_URL" ]; then
   DB_NAME="$(echo $url | grep / | cut -d/ -f2-)"
 fi
 
+
+write_user_auth () {
+  local user="$1"
+  local passwd="$2"
+
+  # Write the password with MD5 encryption, to avoid printing it during startup.
+  # Notice that `docker inspect` will show unencrypted env variables.
+  if ! grep -q "^\"$user\"" ${PG_CONFIG_DIR}/userlist.txt; then
+    local encrypted_pass="md5$(echo -n "$passwd$user" | md5sum | cut -f 1 -d ' ')"
+    echo "\"$user\" \"$encrypted_pass\"" >> ${PG_CONFIG_DIR}/userlist.txt
+    echo "Wrote authentication credentials for $user to ${PG_CONFIG_DIR}/userlist.txt"
+  fi
+}
+
 # Write the password with MD5 encryption, to avoid printing it during startup.
 # Notice that `docker inspect` will show unencrypted env variables.
-if [ -n "$DB_USER" -a -n "$DB_PASSWORD" ] && ! grep -q "^\"$DB_USER\"" ${PG_CONFIG_DIR}/userlist.txt; then
-  encrypted_pass="md5$(echo -n "$DB_PASSWORD$DB_USER" | md5sum | cut -f 1 -d ' ')"
-  echo "\"$DB_USER\" \"$encrypted_pass\"" >> ${PG_CONFIG_DIR}/userlist.txt
-  echo "Wrote authentication credentials to ${PG_CONFIG_DIR}/userlist.txt"
+if [ -n "$DB_USER" -a -n "$DB_PASSWORD" ]; then
+  write_user_auth "$DB_USER" "$DB_PASSWORD"
 fi
 
-if [ -n "$ADMIN_USERS" -a -n "$ADMIN_PASSWORD" ] && ! grep -q "^\"$ADMIN_USERS\"" ${PG_CONFIG_DIR}/userlist.txt; then
-  encrypted_pass="md5$(echo -n "$ADMIN_PASSWORD$ADMIN_USERS" | md5sum | cut -f 1 -d ' ')"
-  echo "\"$ADMIN_USERS\" \"$encrypted_pass\"" >> ${PG_CONFIG_DIR}/userlist.txt
-  echo "Wrote authentication credentials to ${PG_CONFIG_DIR}/userlist.txt"
+# HACK: Allow a debug user. Cannot use auth_user + auth_query because RDS does not
+# permit query of user passwords.
+if [ -n "$DB_USER_DEBUG" -a -n "$DB_PASSWORD_DEBUG" ]; then
+  write_user_auth "$DB_USER_DEBUG" "$DB_PASSWORD_DEBUG"
 fi
+
+if [ -n "$ADMIN_USER" -a -n "$ADMIN_USER_PASSWORD" ]; then
+  write_user_auth "$ADMIN_USER" "$ADMIN_USER_PASSWORD"
+fi
+
+if [ -n "$STATS_USER" -a -n "$STATS_USER_PASSWORD" ]; then
+  write_user_auth "$STATS_USER" "$STATS_USER_PASSWORD"
+fi
+
 
 if [ ! -f ${PG_CONFIG_DIR}/pgbouncer.ini ]; then
   echo "Create pgbouncer config in ${PG_CONFIG_DIR}"
@@ -60,9 +81,7 @@ if [ ! -f ${PG_CONFIG_DIR}/pgbouncer.ini ]; then
   printf "\
 ################## Auto generated ##################
 [databases]
-${DB_NAME:-*} = host=${DB_HOST:?"Setup pgbouncer config error! You must set DB_HOST env"} \
-port=${DB_PORT:-5432} user=${DB_USER:-postgres}
-${CLIENT_ENCODING:+client_encoding = ${CLIENT_ENCODING}\n}\
+${DB_NAME:-*} = host=${DB_HOST:?"Setup pgbouncer config error! You must set DB_HOST env"} port=${DB_PORT:-5432}
 
 [pgbouncer]
 listen_addr = ${LISTEN_ADDR:-0.0.0.0}
@@ -73,6 +92,7 @@ auth_file = ${AUTH_FILE:-$PG_CONFIG_DIR/userlist.txt}
 ${AUTH_HBA_FILE:+auth_hba_file = ${AUTH_HBA_FILE}\n}\
 auth_type = ${AUTH_TYPE:-md5}
 ${AUTH_QUERY:+auth_query = ${AUTH_QUERY}\n}\
+${AUTH_USER:+auth_user = ${AUTH_USER}\n}\
 ${POOL_MODE:+pool_mode = ${POOL_MODE}\n}\
 ${MAX_CLIENT_CONN:+max_client_conn = ${MAX_CLIENT_CONN}\n}\
 ${DEFAULT_POOL_SIZE:+default_pool_size = ${DEFAULT_POOL_SIZE}\n}\
@@ -92,8 +112,10 @@ ${LOG_DISCONNECTIONS:+log_disconnections = ${LOG_DISCONNECTIONS}\n}\
 ${LOG_POOLER_ERRORS:+log_pooler_errors = ${LOG_POOLER_ERRORS}\n}\
 ${STATS_PERIOD:+stats_period = ${STATS_PERIOD}\n}\
 ${VERBOSE:+verbose = ${VERBOSE}\n}\
-admin_users = ${ADMIN_USERS:-postgres}
-${STATS_USERS:+stats_users = ${STATS_USERS}\n}\
+
+# Console access settings
+${ADMIN_USER:+admin_users = ${ADMIN_USER}\n}\
+${STATS_USER:+stats_users = ${STATS_USER}\n}\
 
 # Connection sanity checks, timeouts
 ${SERVER_RESET_QUERY:+server_reset_query = ${SERVER_RESET_QUERY}\n}\
@@ -146,25 +168,15 @@ cat ${PG_CONFIG_DIR}/pgbouncer.ini
 echo "Starting $*..."
 fi
 
-# pgbouncer-healthcheck never really logs anything interesting [logs nothing except startup, and panics], so we are okay
-# to run in background. We can check the main logs from pgbouncer to find out if something went haywire.
-# Interrupts should kill the background process. Mostly useful when testing locally in terminal.
-trap 'kill $pid; exit' INT
-export PGBOUNCER_PORT="${LISTEN_PORT:-5432}"
-if [ -n "$ADMIN_USERS" -a -n "$ADMIN_PASSWORD" ]; then
+if [ -n "$STATS_USER" ]; then
+  # pgbouncer-healthcheck never really logs anything interesting [logs nothing except startup, and panics], so we are okay
+  # to run in background. We can check the main logs from pgbouncer to find out if something went haywire.
+  # Interrupts should kill the background process. Mostly useful when testing locally in terminal.
+  trap 'kill $pid; exit' INT
+  export CONNSTR="host=localhost user=$STATS_USER dbname=pgbouncer port=${LISTEN_PORT:-5432} sslmode=disable"
   export ENHANCED_CHECK="true"
-  dbname="pgbouncer"
-  export PGUSER="$ADMIN_USERS"
-  export PGPASSWORD="$ADMIN_PASSWORD"
-else
-  export ENHANCED_CHECK="false"
-  dbname="$DB_NAME"
-  export PGUSER="$DB_USER"
-  export PGPASSWORD="$DB_PASSWORD"
+  PGPASSWORD=$STATS_USER_PASSWORD /pgbouncer-healthcheck &
+  pid=$!
 fi
-export CONNSTR="host=localhost dbname=$dbname sslmode=disable"
-/pgbouncer-healthcheck &
-pid=$!
 
-unset CONNSTR PGBOUNCER_PORT ENHANCED_CHECK PGUSER PGPASSWORD
 /usr/bin/pgbouncer "$@"
